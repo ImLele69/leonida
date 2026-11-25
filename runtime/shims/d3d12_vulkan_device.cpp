@@ -1835,6 +1835,8 @@ struct DeviceState {
     bool upload_in_vram = false;
     // D3D-299: the first texture or default-heap buffer that lands outside device-local memory is logged, once.
     mutable std::once_flag spill_logged;
+    // GetTickCount64 until which allocate tries a memory type once instead of six times (see allocate).
+    mutable std::array<std::atomic<std::uint64_t>, VK_MAX_MEMORY_TYPES> type_exhausted_until{};
 
     // What D3D12_OPTIONS1 answers with: the physical device's own subgroup facts, read on first use.
     struct SubgroupFacts {
@@ -3959,8 +3961,10 @@ struct DeviceState {
             // map memory with base addr ..."), with gigabytes free. The title asserts on the texture it loses. So
             // allocations and imports take turns (memory_mutex), and that answer is retried before it is believed.
             // Once in the BAR window: without Resizable BAR the driver gives the same answer when its 256 MiB are
-            // used up, and five more tries under the mutex only hold up every other allocation.
-            const int attempts = leonida::bar_window_type(memory, i) ? 1 : 6;
+            // used up. Once too in a type whose last six tries all failed in the past two seconds: the driver also
+            // answers so when VRAM is full, and more tries under the mutex only hold up every other allocation.
+            const bool exhausted = GetTickCount64() < type_exhausted_until[i].load(std::memory_order_relaxed);
+            const int attempts = leonida::bar_window_type(memory, i) || exhausted ? 1 : 6;
             VkResult allocated = VK_ERROR_OUT_OF_HOST_MEMORY;
             for (int attempt = 0; attempt < attempts && allocated == VK_ERROR_OUT_OF_HOST_MEMORY; ++attempt) {
                 if (attempt) Sleep(attempt);
@@ -3975,6 +3979,8 @@ struct DeviceState {
                                      attempt, static_cast<unsigned long long>(requirements.size), i);
                 }
             }
+            if (allocated == VK_ERROR_OUT_OF_HOST_MEMORY && attempts > 1)
+                type_exhausted_until[i].store(GetTickCount64() + 2000, std::memory_order_relaxed);
             if (allocated != VK_SUCCESS) {
                 static std::atomic<int> logged{0};
                 static std::atomic<std::uint64_t> failures{0};
