@@ -2184,6 +2184,8 @@ if(TARGET Vulkan::Headers)
     # /bigobj: a Debug build of d3d12_vulkan_device.cpp has more sections than a COFF object holds by default
     # (fatal error C1128), because without optimisation every inline function keeps its own COMDAT.
     target_compile_options(gta6rt_d3d12_com PRIVATE /W4 /permissive- /utf-8 /bigobj)
+    # copy_guarded and hash_guarded live here, not in gta6rt: the same /EHa as gta6rt's (see there).
+    target_compile_options(gta6rt_d3d12_com PRIVATE $<$<CXX_COMPILER_ID:Clang>:/EHa>)
 
     add_executable(d3d12_com_test test/d3d12_com_test.cpp)
     target_link_libraries(d3d12_com_test PRIVATE gta6rt_d3d12_com)
