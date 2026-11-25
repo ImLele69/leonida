@@ -209,6 +209,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   add_dependencies(gta6rt gta6rt_tls_host bcpack_history_train)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
+  # __try guards reads of the title's memory in several sources (copy_guarded and hash_guarded in the D3D12 layer,
+  # title_page_watch.h, the file system and the PE loader). clang-cl turns memcpy into an intrinsic it assumes cannot
+  # throw, so without asynchronous exceptions a fault inside one of those copies is not caught: the process dies on
+  # a page the title unmapped between the check and the read. MSVC always catches them.
+  target_compile_options(gta6rt PRIVATE $<$<CXX_COMPILER_ID:Clang>:/EHa>)
   # Static shim tables register themselves at startup; keep the linker from dropping their objects.
   # GTA6RT_HOST_BASE keeps the loader's own image off the default x64 EXE base (0x140000000), where a mapped EXE
   # without relocations wants to go. Windows moves the EXE with ASLR anyway; Wine loads it at its preferred base.
