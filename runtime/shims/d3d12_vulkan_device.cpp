@@ -3958,8 +3958,11 @@ struct DeviceState {
             // and then while other threads import host pointers that the kernel module cannot pin (journal: "Cannot
             // map memory with base addr ..."), with gigabytes free. The title asserts on the texture it loses. So
             // allocations and imports take turns (memory_mutex), and that answer is retried before it is believed.
+            // Once in the BAR window: without Resizable BAR the driver gives the same answer when its 256 MiB are
+            // used up, and five more tries under the mutex only hold up every other allocation.
+            const int attempts = leonida::bar_window_type(memory, i) ? 1 : 6;
             VkResult allocated = VK_ERROR_OUT_OF_HOST_MEMORY;
-            for (int attempt = 0; attempt < 6 && allocated == VK_ERROR_OUT_OF_HOST_MEMORY; ++attempt) {
+            for (int attempt = 0; attempt < attempts && allocated == VK_ERROR_OUT_OF_HOST_MEMORY; ++attempt) {
                 if (attempt) Sleep(attempt);
                 std::lock_guard serial(memory_mutex());
                 allocated = context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out);
@@ -3974,6 +3977,12 @@ struct DeviceState {
             }
             if (allocated != VK_SUCCESS) {
                 static std::atomic<int> logged{0};
+                static std::atomic<std::uint64_t> failures{0};
+                const std::uint64_t failed = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (failed > 16 && (failed & (failed - 1)) == 0)
+                    std::fprintf(stderr, "[rt] d3d12: vkAllocateMemory has failed %llu times (last: type %u, %llu bytes)\n",
+                                 static_cast<unsigned long long>(failed), i,
+                                 static_cast<unsigned long long>(requirements.size));
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
                     std::fprintf(stderr,
                                  "[rt] d3d12: vkAllocateMemory failed (%d): %llu bytes, memory type %u (flags 0x%x, heap "
