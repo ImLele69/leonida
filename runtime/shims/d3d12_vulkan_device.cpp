@@ -164,28 +164,40 @@ std::uint64_t vsharp_address(std::uint64_t va, std::uint64_t bytes,
 }
 
 // memcpy that a page fault ends instead of killing the process: the title may decommit a page between the
-// VirtualQuery that saw it committed and the read. No C++ objects here: it is a __try frame.
+// VirtualQuery that saw it committed and the read.
 // `streaming` reads with MOVNTDQA, for write-combined pages: ordinary loads from them are not cached, and memcpy
 // read 64 MiB of them in 253 ms on a Core i9-13900K (253 MiB/s), MOVNTDQA in 13 to 17 ms (4 to 5 GiB/s). Paid at every submission.
 #if defined(__clang__) && defined(_M_X64)
 __attribute__((target("sse4.1")))
 #endif
+__declspec(noinline) void copy_unguarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
+    if (streaming) {
+        const std::size_t head = std::min<std::size_t>(bytes, (0 - reinterpret_cast<std::uintptr_t>(from)) & 63);
+        std::memcpy(to, from, head);
+        to += head, from += head, bytes -= head;
+        for (; bytes >= 64; to += 64, from += 64, bytes -= 64) {
+            const auto* in = reinterpret_cast<const __m128i*>(from);
+            const __m128i a = _mm_stream_load_si128(in), b = _mm_stream_load_si128(in + 1);
+            const __m128i c = _mm_stream_load_si128(in + 2), d = _mm_stream_load_si128(in + 3);
+            auto* out = reinterpret_cast<__m128i*>(to);
+            _mm_storeu_si128(out, a), _mm_storeu_si128(out + 1, b);
+            _mm_storeu_si128(out + 2, c), _mm_storeu_si128(out + 3, d);
+        }
+    }
+    std::memcpy(to, from, bytes);
+}
+
+// The guarded reads call their body through a volatile pointer. Built with clang-cl and /EHsc, a __try covers a fault
+// only inside a call the compiler cannot see through: it lowers memcpy to an intrinsic it treats as unable to throw,
+// and loads inlined into the __try block are not covered either, so the __except never ran and a page the title had
+// just unmapped killed the process. MSVC catches both ways; /EHa would too, but clang 20 then leaves std::variant's
+// trivial destructor undefined at link time.
+void (*volatile copy_unguarded_call)(std::uint8_t*, const std::uint8_t*, std::size_t, bool) = &copy_unguarded;
+
+// No C++ objects here: it is a __try frame.
 bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
     __try {
-        if (streaming) {
-            const std::size_t head = std::min<std::size_t>(bytes, (0 - reinterpret_cast<std::uintptr_t>(from)) & 63);
-            std::memcpy(to, from, head);
-            to += head, from += head, bytes -= head;
-            for (; bytes >= 64; to += 64, from += 64, bytes -= 64) {
-                const auto* in = reinterpret_cast<const __m128i*>(from);
-                const __m128i a = _mm_stream_load_si128(in), b = _mm_stream_load_si128(in + 1);
-                const __m128i c = _mm_stream_load_si128(in + 2), d = _mm_stream_load_si128(in + 3);
-                auto* out = reinterpret_cast<__m128i*>(to);
-                _mm_storeu_si128(out, a), _mm_storeu_si128(out + 1, b);
-                _mm_storeu_si128(out + 2, c), _mm_storeu_si128(out + 3, d);
-            }
-        }
-        std::memcpy(to, from, bytes);
+        copy_unguarded_call(to, from, bytes, streaming);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -207,20 +219,24 @@ inline std::uint64_t mix_words(std::uint64_t h, const std::uint8_t* at, std::siz
     }
     return h;
 }
+__declspec(noinline) std::uint64_t hash_unguarded(const std::uint8_t* p, std::size_t bytes, bool every_byte) {
+    std::uint64_t h = 0x9e3779b97f4a7c15ull ^ bytes;
+    if (bytes <= (256u << 10) || every_byte) {
+        h = mix_words(h, p, bytes & ~std::size_t(7));
+        for (std::size_t i = bytes & ~std::size_t(7); i < bytes; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+    } else {
+        for (std::size_t page = 0; page + 4096 <= bytes; page += 4096) {
+            h = mix_words(h, p + page, 64);
+            h = mix_words(h, p + page + 2048, 64);
+        }
+        h = mix_words(h, p + bytes - 64, 64);
+    }
+    return h;
+}
+std::uint64_t (*volatile hash_unguarded_call)(const std::uint8_t*, std::size_t, bool) = &hash_unguarded;  // see copy_guarded
 bool hash_guarded(const std::uint8_t* p, std::size_t bytes, std::uint64_t& out, bool every_byte = false) {
     __try {
-        std::uint64_t h = 0x9e3779b97f4a7c15ull ^ bytes;
-        if (bytes <= (256u << 10) || every_byte) {
-            h = mix_words(h, p, bytes & ~std::size_t(7));
-            for (std::size_t i = bytes & ~std::size_t(7); i < bytes; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
-        } else {
-            for (std::size_t page = 0; page + 4096 <= bytes; page += 4096) {
-                h = mix_words(h, p + page, 64);
-                h = mix_words(h, p + page + 2048, 64);
-            }
-            h = mix_words(h, p + bytes - 64, 64);
-        }
-        out = h;
+        out = hash_unguarded_call(p, bytes, every_byte);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
